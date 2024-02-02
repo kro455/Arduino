@@ -14,12 +14,18 @@
 #define SUPER_LED_PIN 9
 #define LED_LCD_A_PIN 10
 #define EEPROM_Addr_ALARM_SIZE 255
-#define MAX_ALARM_SIZE 20
+#define EEPROM_Addr_SMART_MODE 200
+#define MAX_ALARM_SIZE 15
+#define MAX_TIME 11000
 
 byte brightness = 15;
+byte brightnessSuperLED = 0;
 bool PowerON = true;
+bool superLedON = false;
 
 bool alarmON = false;
+bool smartON = false;
+byte ptime = 99;
 
 IRrecv receiver(RECEIVER_PIN);
 LiquidCrystal lcd = LiquidCrystal(A0, A1, A2, A3, A4, A5);  // LiquidCrystal(rs,en,d4,d5,d6,d7);
@@ -45,8 +51,11 @@ struct Alarm {
     Serial.println(repeat, BIN);
   }
 
-  String getRepeat(byte dow) {
-    return bitRead(repeat, dow) ? "On" : "Off";
+  byte getRepeat(byte dow) {
+    return bitRead(repeat, dow);
+  }
+  String getRepeatStr(byte dow) {
+    return bitRead(repeat, dow) ? F(" ON") : F(" OFF");
   }
 
   void setStatus() {
@@ -55,32 +64,106 @@ struct Alarm {
   }
 
   String getStatus() {
-    return (status ? "On" : "Off");
+    return (status ? F("ON") : F("OFF"));
+  }
+
+  Alarm subtractTime(int min) {
+    Alarm result;
+    int resultHour = hour;
+    int resultMinute = minute - min;
+    if (resultMinute < 0) {
+      resultHour--;
+      resultMinute += 60;
+    }
+    if (resultHour < 0) {
+      resultHour += 24;
+    }
+    result.hour = resultHour;
+    result.minute = resultMinute;
+    return result;
   }
 
   String toString() {
-    return ((hour < 10) ? "0" : "") + String(hour) + ":" + ((minute < 10) ? "0" : "") + String(minute);
+    return ((hour < 10) ? "0" : "") + String(hour) + F(":") + ((minute < 10) ? F("0") : F("")) + String(minute);
+  }
+  String toStringAndStatus() {
+    return toString() + F(" ") + getStatus();
+  }
+};
+
+struct SmartMode {
+  byte mode;
+  byte lightTime;
+  byte sensitivity;
+  byte closeMode;
+  byte scored;
+
+  SmartMode() {
+    mode = 0;
+    lightTime = 30;
+    sensitivity = 1;
+    closeMode = 0;
+    scored = 0;
+  }
+  void setMode() {
+    mode = (mode + 1) % 3;
+  }
+  void setSensitivity() {
+    sensitivity += (sensitivity > 0) ? -1 : 2;
+  }
+  void setCloseMode() {
+    closeMode = (closeMode + 1) % 3;
+  }
+
+  String getMode() {
+    switch (mode) {
+      case 0: return F(" Normal");
+      case 1: return F(" Simple");
+      case 2: return F(" Smart ");
+    }
+  }
+  String getSensitivity() {
+    switch (sensitivity) {
+      case 0: return F("  HIGH ");
+      case 1: return F(" Normal");
+      case 2: return F("  LOW  ");
+    }
+  }
+  String getCloseMode() {
+    switch (closeMode) {
+      case 0: return F("Normal");
+      case 1: return F("Gaming");
+      case 2: return F("Moving");
+    }
+  }
+  String getScored() {
+    return String(scored) + ((closeMode == 2) ? F("Min") : F(""));
   }
 };
 
 Alarm currentAlarm;
+Alarm smartAlarm;
+byte EEPROM_index = -1;
+SmartMode smartMode;
 byte alarmSize = 0;
 
 void setup() {
   Serial.begin(115200);
+  setupLCD();
   rtc.begin();
   EEPROM.get(EEPROM_Addr_ALARM_SIZE, alarmSize);
+  EEPROM.get(EEPROM_Addr_SMART_MODE, smartMode);
+  findNextAlarm();
   //rtc.setTime(13, 1, 50);
   //rtc.setDate(21, 1, 2024);
   receiver.enableIRIn();  // start the IR receiver
   pinMode(BUZZER_PIN, OUTPUT);
   pinMode(RADAR_OUT_PIN, INPUT);
   pinMode(BUTTON, INPUT_PULLUP);
-  setupLCD();
 }
-unsigned long last_read = millis();
 void loop() {
   movingTargetDetected();
+  daemon_Alarm();
   displayTime();
   char key = getKey();
   switch (key) {
@@ -88,27 +171,167 @@ void loop() {
       menuHome();
       break;
     case 'T':
-      SUPER_LED_ON();
-      break;
-    case '0':
-      analogWrite(SUPER_LED_PIN, 0);
+      Serial.println(currentAlarm.toString());
+      Serial.println(calculateTimeToNextAlarm(currentAlarm));
       break;
   }
 }
 
-void SUPER_LED_ON() {
-  analogWrite(SUPER_LED_PIN, 255);
-  analogWrite(SUPER_LED_PIN, 0);
-  delay(50);
-  analogWrite(SUPER_LED_PIN, 255);
+void menuHome() {
+  String option[] = { F("Setting"), F("Set Alarm"), F("Alarm Mode"), F("Testing Mode") };
+  menuExecFunc(option, sizeof(option) / sizeof(option[0]), menuFuncHome);
 }
 
+void menuFuncHome(byte number) {
+  switch (number) {
+    case 0:
+      menuSetting();
+      break;
+    case 1:
+      menuAlarm();
+      findNextAlarm();
+      break;
+    case 2:
+      alarmMode();
+      break;
+    case 3:
+      dinoGame(0);
+      setup();
+      break;
+  }
+}
+
+void daemon_Alarm() {
+  Time t = rtc.getTime();
+  if (currentAlarm.status == true && ((currentAlarm.getRepeat(t.dow) == 1 && currentAlarm.getRepeat(0) == 1) || currentAlarm.getRepeat(0) == 0)
+      && currentAlarm.hour == t.hour && currentAlarm.minute == t.min) {
+    alarmON = true;
+  }
+  // FIXME: still have bug not fixed yet
+  if (smartMode.mode == 1) {  // simple mode 
+    smartAlarm = currentAlarm.subtractTime(smartMode.lightTime);
+    if (smartAlarm.status == true && ((smartAlarm.getRepeat(t.dow) == 1 && smartAlarm.getRepeat(0) == 1) || smartAlarm.getRepeat(0) == 0)
+        && smartAlarm.hour == t.hour && smartAlarm.minute >= t.min) {
+      smartON = true;
+    }
+  }
+  alarmActice();
+}
+void alarmActice() {
+  static byte last_min = rtc.getTime().min;
+  analogWrite(SUPER_LED_PIN, brightnessSuperLED);
+  if (alarmON) {
+    SUPER_LED_ON();
+    beep(50);
+    if (rtc.getTime().min != last_min) {
+      last_min = rtc.getTime().min;
+      if (255 - (255 / smartMode.lightTime) > brightnessSuperLED)
+        brightnessSuperLED += 255 / smartMode.lightTime;
+    }
+    if (getKey() != 0 || (digitalRead(BUTTON) == LOW)) {
+      brightnessSuperLED = 1;
+      analogWrite(SUPER_LED_PIN, brightnessSuperLED);
+      switch (smartMode.closeMode) {
+        case 1:
+          dinoGame(smartMode.scored);
+          setup();
+          break;
+        case 2:
+          keepMoving(smartMode.scored);
+          break;
+      }
+      lcd.clear();
+      lcd.print(F("Good Moring!"));
+      alarmON = false;
+      smartON = false;
+      brightnessSuperLED = 0;
+      superLedON = false;
+      digitalWrite(BUZZER_PIN, LOW);
+      if (currentAlarm.getRepeat(0) == 0) {
+        currentAlarm.status = false;
+        EEPROMsetAlarm(EEPROM_index, currentAlarm);
+      };
+      lcd.setCursor(0, 1);
+      if (findNextAlarm()) {
+        lcd.print(F("Next Alarm:"));
+        lcd.print(currentAlarm.toString());
+      } else {
+        lcd.print(F("No further alarm"));
+      }
+      delay(2000);
+      lcd.clear();
+    }
+  }
+}
+
+int calculateTimeToNextAlarm(Alarm alarm) {
+  if (!alarm.status) return -1;  // alarm is OFF
+  bool nextday = false;
+  Time t = rtc.getTime();
+  int timeToNextAlarm = 0;
+  if (alarm.hour > t.hour || (alarm.hour == t.hour && alarm.minute > t.min)) {
+    timeToNextAlarm += (alarm.hour - t.hour) * 60 + (alarm.minute - t.min);  //time to next hour
+  } else {
+    timeToNextAlarm = (24 - t.hour + alarm.hour) * 60 + (alarm.minute - t.min);
+    nextday = true;
+  }
+  if (alarm.getRepeat(0) == 0) {
+    return timeToNextAlarm;  // alarm repeat 1 times!
+  }
+  for (int i = 1; i < 8; i++) {
+    int dow = t.dow + i;
+    while (dow > 7) dow -= 7;
+    Serial.println("dow: " + String(dow));
+    Serial.println(alarm.getRepeat(dow));
+    if (alarm.getRepeat(dow) == 1) {
+      return timeToNextAlarm + (nextday ? i - 1 : i) * 24 * 60;
+    }
+  }
+  return -1;
+}
+
+bool findNextAlarm() {
+  int min_time = MAX_TIME;
+  int index_min = 0;
+  for (int i = 0; i < alarmSize; i++) {
+    Alarm a = EEPROMgetAlarm(i);
+    if (!a.status) continue;
+    int time = calculateTimeToNextAlarm(a);
+    if (time < min_time) {
+      min_time = time;
+      index_min = i;
+    }
+  }
+  if (min_time < MAX_TIME) {
+    currentAlarm = EEPROMgetAlarm(index_min);
+    EEPROM_index = index_min;
+    return true;
+  }
+  currentAlarm = Alarm(24, 0);
+  EEPROM_index = -1;
+  return false;
+}
+
+void SUPER_LED_ON() {
+  if (!superLedON) {
+    superLedON = true;
+    analogWrite(SUPER_LED_PIN, 255);
+    analogWrite(SUPER_LED_PIN, 0);
+    delay(50);
+    analogWrite(SUPER_LED_PIN, 255);
+    analogWrite(SUPER_LED_PIN, 0);
+    delay(50);
+    analogWrite(SUPER_LED_PIN, brightnessSuperLED);
+  }
+}
+
+unsigned long last_read = millis();
 void movingTargetDetected() {
   static unsigned long time_detected_moving = 0;
   static bool is_moving = false;
   static unsigned long data = 0;
   static unsigned long total = 0;
-  if (rtc.getTime().hour == 3) alarmON = true;
+  static int sum = 0;
   if (digitalRead(RADAR_OUT_PIN) == HIGH) {
     if (!is_moving) {
       is_moving = true;
@@ -125,32 +348,156 @@ void movingTargetDetected() {
     last_read = millis();
     Serial.print(F("Total: "));
     Serial.println(total);
-    if (total > 50 && alarmON) {
-      SUPER_LED_ON();
-    }
-    total = 0;
+  }
+  if (smartON == true && is_moving && ((millis() - time_detected_moving) / 1000) > smartMode.sensitivity * 5) {
+    alarmON = true;
   }
   //return is_moving ? (millis() - time_detected_moving) / 1000 : 0;
 }
 
-void menuHome() {
-  String option[] = { F("Setting"), F("Alarm"), F("Dino Game") };
-  menuExecFunc(option, sizeof(option) / sizeof(option[0]), menuFuncHome);
+void alarmMode() {
+  char index_choice = 0;
+  byte index_display = 0;
+  byte length_of_option = 5;
+  while (true) {
+    String option[] = { "Mode:" + smartMode.getMode(),
+                        "Light: " + String(smartMode.lightTime) + F(" Min"),
+                        "Sens :" + smartMode.getSensitivity(),
+                        "CloseM:" + smartMode.getCloseMode(),
+                        "Scored:" + smartMode.getScored() };
+    if (smartMode.closeMode == 0) length_of_option = 4;
+    else length_of_option = 5;
+    displayMenu(index_choice, index_display, option, length_of_option);
+    char key = getKeyNotBlank();
+    switch (key) {
+      case 'E':
+        alarmChangeMode(index_choice);
+        break;
+      case '+':
+        if (--index_choice < 0) { index_choice += length_of_option; }
+        break;
+      case '-':
+        if (++index_choice == length_of_option) { index_choice = 0; }
+        break;
+      case 'B':
+        return;
+    }
+    if (index_choice >= (index_display + MAX_LINE_LCD)) {
+      index_display = index_choice - MAX_LINE_LCD + 1;
+    } else if (index_choice < index_display) {
+      index_display = index_choice;
+    }
+  }
 }
 
-void menuFuncHome(byte number) {
-  switch (number) {
+void alarmChangeMode(byte index) {
+  switch (index) {
     case 0:
-      menuSetting();
+      smartMode.setMode();
       break;
     case 1:
-      menuAlarm();
+      setLightTime();
       break;
     case 2:
-      dinoGame();
-      setup();
+      smartMode.setSensitivity();
       break;
     case 3:
+      smartMode.setCloseMode();
+      break;
+    case 4:
+      setScored();
+      break;
+  }
+  EEPROM.put(EEPROM_Addr_SMART_MODE, smartMode);
+}
+
+void setScored() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("Scored of "));
+  lcd.print(smartMode.closeMode == 1 ? F("Gaming") : F("Moving"));
+  lcd.setCursor(0, 1);
+  lcd.print(F("current: "));
+  while (true) {
+    lcd.setCursor(9, 1);
+    lcd.print(smartMode.scored);
+    lcd.print(F(" "));
+    char key = getKeyNotBlank();
+    switch (key) {
+      case '+':
+        if (smartMode.scored < 20)
+          smartMode.scored++;
+        else
+          lcd.print(F("MAX"));
+        break;
+      case '-':
+        if (smartMode.scored > 1)
+          smartMode.scored--;
+        else
+          lcd.print(F("MIN"));
+        break;
+      case 'B':
+        return;
+    }
+    lcd.print(F("   "));
+  }
+}
+void setLightTime() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print(F("   LightTime   "));
+  lcd.setCursor(0, 1);
+  lcd.print(F("current: "));
+  while (true) {
+    lcd.setCursor(9, 1);
+    lcd.print(smartMode.lightTime);
+    lcd.print(F(" "));
+    char key = getKeyNotBlank();
+    switch (key) {
+      case '+':
+        if (smartMode.lightTime < 60)
+          smartMode.lightTime++;
+        else
+          lcd.print(F("MAX"));
+        break;
+      case '-':
+        if (smartMode.lightTime > 0)
+          smartMode.lightTime--;
+        else
+          lcd.print(F("MIN"));
+        break;
+      case 'B':
+        return;
+    }
+    lcd.print(F("   "));
+  }
+}
+
+void testingMode() {
+  String option[] = { F("Testing BUTTON"), F("Testing BUZZER"), F("Testing Radar"),
+                      F("Testing Remote"), F("Testing Super LED"), F("Testing Dino game") };
+  menuExecFunc(option, sizeof(option) / sizeof(option[0]), testingModeFunc);
+}
+
+void testingModeFunc(byte index) {
+  switch (index) {
+    case 0:
+      //testButton();
+      break;
+    case 1:
+      break;
+    case 2:
+      break;
+    case 3:
+      break;
+    case 4:
+      SUPER_LED_ON();
+      delay(2000);
+      analogWrite(SUPER_LED_PIN, 0);
+      break;
+    case 5:
+      dinoGame(10);
+      setup();
       break;
   }
 }
@@ -162,7 +509,7 @@ void menuAlarm() {
   option[0] = F("New Alarm");
   while (true) {
     for (int i = 0; i < alarmSize; i++) {
-      option[i + 1] = EEPROMgetAlarm(i).toString();
+      option[i + 1] = EEPROMgetAlarm(i).toStringAndStatus();
     }
     displayMenu(index_choice, index_display, option, alarmSize + 1);
     char key = getKeyNotBlank();
@@ -212,7 +559,7 @@ int settingAlarm(byte index) {
   byte index_display = 0;
   byte length_of_option = 4;
   while (true) {
-    String option[] = { "Status: " + currentAlarm.getStatus(), F("Set Alarm"), F("Set Repeat"), F("Delete Alarm") };
+    String option[] = { "Status: " + currentAlarm.getStatus(), F("Set Time"), F("Set Repeat"), F("Delete Alarm") };
     //Serial.println((int)index_choice);
     displayMenu(index_choice, index_display, option, length_of_option);
     char key = getKeyNotBlank();
@@ -269,14 +616,14 @@ void setRepeat() {
   byte index_display = 0;
   byte length_of_option = 8;
   while (true) {
-    String option[8] = { "POW:" + currentAlarm.getRepeat(0),
-                         "Mon:" + currentAlarm.getRepeat(1),
-                         "Tue:" + currentAlarm.getRepeat(2),
-                         "Wed:" + currentAlarm.getRepeat(3),
-                         "Thu:" + currentAlarm.getRepeat(4),
-                         "Fri:" + currentAlarm.getRepeat(5),
-                         "Sat:" + currentAlarm.getRepeat(6),
-                         "Sun:" + currentAlarm.getRepeat(7) };
+    String option[8] = { "Power:" + currentAlarm.getRepeatStr(0),
+                         "Mon:" + currentAlarm.getRepeatStr(1),
+                         "Tue:" + currentAlarm.getRepeatStr(2),
+                         "Wed:" + currentAlarm.getRepeatStr(3),
+                         "Thu:" + currentAlarm.getRepeatStr(4),
+                         "Fri:" + currentAlarm.getRepeatStr(5),
+                         "Sat:" + currentAlarm.getRepeatStr(6),
+                         "Sun:" + currentAlarm.getRepeatStr(7) };
     displayMenu(index_choice, index_display, option, length_of_option);
     char key = getKeyNotBlank();
     switch (key) {
@@ -327,8 +674,7 @@ void EEPROMsetAlarm(byte index, Alarm alarm) {
 
 void setAlarm(byte index) {
   EEPROMgetAlarm(index);
-  String option[] = { F(" Hour"), F(" Min") };
-  methodExecFunc(option, sizeof(option) / sizeof(option[0]), setAlarmFunc, displayCurrentAlarm);
+  setAlarm();
 }
 
 void setAlarm() {
@@ -531,7 +877,7 @@ void changeDateFunc(byte index, char key) {
 void methodExecFunc(String option[], int length_of_option, void (*execFunc)(int, char), void (*displayFunc)()) {
   char index_choice = 0;
   while (true) {
-    MEMORY_PRINT_FREERAM
+    //MEMORY_PRINT_FREERAM
     displayFunc();
     displayMethod(index_choice, option);
     char key = getKeyNotBlank();
@@ -653,14 +999,14 @@ void setBrightness() {
 
 void setBrightness(byte number) {
   analogWrite(LED_LCD_A_PIN, number);
-  //analogWrite(SUPER_LED_PIN, number);
   PowerON = (number != 0);
 }
 
 void displayTime() {
   lcd.setCursor(0, 0);
-  lcd.print(char(3));
-  //lcd.write(byte(3));
+  if (currentAlarm.hour != 24) {
+    lcd.write(byte(3));
+  } else lcd.print(F(" "));
   lcd.print(rtc.getTimeStr());
   lcd.print(F(" | "));
   lcd.print((byte)rtc.getTemp() - 3);
@@ -684,7 +1030,7 @@ char getKeyNotBlank() {
 char getKey() {
   //MEMORY_PRINT_FREERAM
   if (receiver.decode()) {
-    Serial.println("raw " + String(receiver.decodedIRData.decodedRawData));
+    //Serial.println("raw " + String(receiver.decodedIRData.decodedRawData));
     char data = decodeKey(receiver.decodedIRData.command);
     //  if (Serial.available() > 0) {
     //   char data = Serial.read();
@@ -794,7 +1140,7 @@ const byte DOS_RAMAS_PART_2[8] PROGMEM = { B00100, B00101, B00101, B10101, B1111
 const byte AVE_ALAS_PART1[8] PROGMEM = { B00001, B00001, B00001, B00001, B01001, B11111, B00000, B00000 };
 const byte AVE_ALAS_PART2[8] PROGMEM = { B00000, B10000, B11000, B11100, B11110, B11111, B00000, B00000 };
 
-void dinoGame() {
+void dinoGame(byte scored) {
   createChar(0, DINO_PARADO_PARTE_1);
   createChar(1, DINO_PARADO_PARTE_2);
   createChar(2, DINO_PIE_DERE_PART_1);
@@ -841,9 +1187,11 @@ void dinoGame() {
           tone(BUZZER_PIN, note[i], 150);
         }
         puntos = 10;
-        punto2 = punto2 + 1;
-        if (punto2 == 100) {
-          punto2 = 0;
+        if (punto2 < 100) {
+          punto2++;
+        }
+        if (punto2 >= scored && scored > 0) {
+          return;
         }
       }
       lcd.setCursor(14, 1);
@@ -911,9 +1259,9 @@ void dinoGame() {
     }
     //char key=getKey();
     //Serial.println("ingame "+String(key));
-    if ((is_jump == false) && (digitalRead(BUTTON) == LOW) || (receiver.decode()) && (millis() - last_jump > periodo2 * 8)) {
+    if ((is_jump == false) && ((digitalRead(BUTTON) == LOW) || (receiver.decode())) && (millis() - last_jump > periodo2 * 8)) {
       last_jump = millis();
-      Serial.println("raw " + String(receiver.decodedIRData.command));
+      //Serial.println("raw " + String(receiver.decodedIRData.command));
       receiver.resume();
     }
     if (millis() - last_jump < periodo2 * 7) {
@@ -952,21 +1300,40 @@ void dinoGame() {
       lcd.print(punto2);
       lcd.print(puntos);
       //delay(2000);
+      unsigned long read_time = millis();
       while (digitalRead(BUTTON)) {
         if (receiver.decode()) {
           receiver.resume();
           break;
         }
-      }
-      unsigned long read_time = millis();
-      while (digitalRead(BUTTON) == LOW) {
-        if (millis() - read_time > 500) return;
+        if (millis() - read_time > 5000) beep(50);
       }
       lcd.clear();
       columna_rama = 15;
       periodo2 = 100;
       puntos = 0;
       punto2 = 0;
+    }
+  }
+}
+
+void keepMoving(byte scored) {
+  lcd.clear();
+  int sec = scored * 60;
+  unsigned long last_update = millis();
+  while (true) {
+    lcd.setCursor(0, 0);
+    lcd.print(F(" Keep moving in "));
+    lcd.setCursor(5, 1);
+    lcd.print(String(sec) + F("s     "));
+    if (digitalRead(RADAR_OUT_PIN) == LOW) {
+      beep(50);
+      sec = scored * 60;
+    }
+    if (millis() - last_update > 1000) {
+      if (sec == 0) return;
+      sec--;
+      last_update = millis();
     }
   }
 }
